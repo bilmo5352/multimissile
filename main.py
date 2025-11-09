@@ -2041,15 +2041,15 @@ def _determine_parallel_workers(explicit_workers: Optional[int] = None) -> int:
     
     # Railway has resource constraints - be more conservative
     if is_railway:
-        # Railway typically has limited resources, use fewer workers
         cpu_count = os.cpu_count() or 2
         ram_gb = _estimate_ram_gb()
-        # More conservative: assume 1GB per Chrome instance on Railway
-        ram_limited = max(1, int(ram_gb / 1.0))
-        # Limit to 2x CPU cores on Railway
-        cpu_limited = max(1, cpu_count * 2)
-        # Cap at 8 workers max on Railway
-        return max(1, min(ram_limited, cpu_limited, 8))
+        # Assume 0.8GB per Chrome instance on Railway (more realistic)
+        ram_limited = max(1, int(ram_gb / 0.8))
+        # Allow up to 4x CPU cores on Railway (can handle more with good RAM)
+        cpu_limited = max(1, cpu_count * 4)
+        # Cap based on RAM: if RAM >= 16GB, allow up to 20 workers, else cap at 8
+        max_workers = 20 if ram_gb >= 16 else 8
+        return max(1, min(ram_limited, cpu_limited, max_workers))
     
     # Standard logic for non-Railway environments
     cpu_count = os.cpu_count() or 4
