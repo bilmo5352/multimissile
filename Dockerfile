@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     fonts-liberation \
+    procps \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -65,9 +66,10 @@ RUN useradd -m -u 1000 appuser && \
 # Switch to non-root user
 USER appuser
 
-# Health check (optional - can be customized)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)" || exit 1
+# Health check - check if Python process is running (for background worker)
+# Using ps to check if main.py process exists
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD ps aux | grep -v grep | grep "python.*main.py" || exit 1
 
 # Run the application
 CMD ["python", "main.py"]
