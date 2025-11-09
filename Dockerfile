@@ -104,19 +104,19 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Create a non-root user for security first (before playwright install)
+# Install Playwright system dependencies as root (before switching users)
+RUN python -m playwright install --with-deps chromium
+
+# Create a non-root user for security
 RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app
+    chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /root/.cache/ms-playwright
 
 # Copy application files
 COPY main.py .
 
-# Switch to non-root user BEFORE installing Playwright browsers
-# This ensures browsers are installed in appuser's home directory
+# Switch to non-root user
 USER appuser
-
-# Install Playwright browsers as appuser
-RUN python -m playwright install --with-deps chromium
 
 # Set Python path
 ENV PYTHONPATH=/app \
