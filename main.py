@@ -18,7 +18,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException
 try:
     from webdriver_manager.chrome import ChromeDriverManager
     WEBDRIVER_MANAGER_AVAILABLE = True
@@ -75,6 +74,7 @@ class UniversalProductExtractor:
         self._thread_local = threading.local()
         self._drivers_lock = threading.Lock()
         self._active_drivers = set()
+        self._driver_creation_lock = threading.Lock()  # Lock for driver creation to prevent race conditions
         
         # Initialize Supabase connection
         self.supabase: Optional[Client] = None
@@ -875,6 +875,11 @@ class UniversalProductExtractor:
         return clicked
 
     def _setup_driver(self) -> webdriver.Chrome:
+        # Use lock to prevent concurrent driver creation (fixes Railway Errno 11)
+        with self._driver_creation_lock:
+            return self._setup_driver_internal()
+
+    def _setup_driver_internal(self) -> webdriver.Chrome:
         chrome_options = Options()
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
@@ -890,6 +895,11 @@ class UniversalProductExtractor:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"]) 
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        
+        # Additional Railway/container-specific options
+        chrome_options.add_argument('--disable-setuid-sandbox')
+        chrome_options.add_argument('--remote-debugging-port=9222')
+        
         chrome_binary = os.getenv("CHROME_BIN")
         if chrome_binary:
             chrome_options.binary_location = chrome_binary
@@ -905,36 +915,63 @@ class UniversalProductExtractor:
         ])
 
         last_error: Optional[Exception] = None
+        max_retries = 3
+        retry_delay = 0.5  # Start with 0.5 seconds
+        
+        # Retry logic for each path
         for path in driver_paths:
             if not path or not os.path.exists(path):
                 continue
-            try:
-                service = Service(path)
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-                driver.set_page_load_timeout(30)
-                return driver
-            except Exception as exc:
-                last_error = exc
-                print(f"[!] Failed to start Chrome using system driver at {path}: {exc}")
+            for attempt in range(max_retries):
+                try:
+                    # Small delay to avoid resource contention
+                    if attempt > 0:
+                        time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                    
+                    service = Service(path)
+                    driver = webdriver.Chrome(service=service, options=chrome_options)
+                    driver.set_page_load_timeout(30)
+                    return driver
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < max_retries - 1:
+                        print(f"[!] Retry {attempt + 1}/{max_retries} for driver at {path}: {exc}")
+                    else:
+                        print(f"[!] Failed to start Chrome using system driver at {path}: {exc}")
 
+        # Retry logic for WebDriver Manager
         if WEBDRIVER_MANAGER_AVAILABLE:
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        time.sleep(retry_delay * (2 ** attempt))
+                    service = Service(ChromeDriverManager().install())
+                    driver = webdriver.Chrome(service=service, options=chrome_options)
+                    driver.set_page_load_timeout(30)
+                    return driver
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < max_retries - 1:
+                        print(f"[!] Retry {attempt + 1}/{max_retries} for WebDriver Manager: {exc}")
+                    else:
+                        print(f"[!] WebDriver Manager failed to obtain driver: {exc}")
+
+        # Final fallback with retry
+        for attempt in range(max_retries):
             try:
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=chrome_options)
+                if attempt > 0:
+                    time.sleep(retry_delay * (2 ** attempt))
+                driver = webdriver.Chrome(options=chrome_options)
                 driver.set_page_load_timeout(30)
                 return driver
             except Exception as exc:
                 last_error = exc
-                print(f"[!] WebDriver Manager failed to obtain driver: {exc}")
-
-        try:
-            driver = webdriver.Chrome(options=chrome_options)
-            driver.set_page_load_timeout(30)
-            return driver
-        except Exception as exc:
-            if last_error:
-                raise last_error
-            raise exc
+                if attempt < max_retries - 1:
+                    print(f"[!] Retry {attempt + 1}/{max_retries} for default Chrome driver: {exc}")
+        
+        if last_error:
+            raise last_error
+        raise RuntimeError("Failed to create Chrome driver after all retries")
 
     def _wait_for_any_selector(self, driver: webdriver.Chrome, selectors: List[str], wait_seconds: int):
         end = time.time() + wait_seconds
@@ -1397,7 +1434,7 @@ class UniversalProductExtractor:
         cleaned = re.sub(r"\s+", " ", text).strip()
         return cleaned or None
 
-    def _parse_price(self, raw: Optional[str]) -> (Optional[float], Optional[str]):
+    def _parse_price(self, raw: Optional[str]) -> Tuple[Optional[float], Optional[str]]:
         if not raw:
             return None, None
         txt = raw.strip()
@@ -1989,6 +2026,27 @@ def _determine_parallel_workers(explicit_workers: Optional[int] = None) -> int:
     env_workers = _get_env_int("MAX_PARALLEL_WORKERS", 0)
     if env_workers > 0:
         return env_workers
+    
+    # Check if running in Railway (common environment indicators)
+    is_railway = (
+        os.getenv("RAILWAY_ENVIRONMENT") is not None or
+        os.getenv("RAILWAY_PROJECT_ID") is not None or
+        os.getenv("RAILWAY_SERVICE_NAME") is not None
+    )
+    
+    # Railway has resource constraints - be more conservative
+    if is_railway:
+        # Railway typically has limited resources, use fewer workers
+        cpu_count = os.cpu_count() or 2
+        ram_gb = _estimate_ram_gb()
+        # More conservative: assume 1GB per Chrome instance on Railway
+        ram_limited = max(1, int(ram_gb / 1.0))
+        # Limit to 2x CPU cores on Railway
+        cpu_limited = max(1, cpu_count * 2)
+        # Cap at 8 workers max on Railway
+        return max(1, min(ram_limited, cpu_limited, 8))
+    
+    # Standard logic for non-Railway environments
     cpu_count = os.cpu_count() or 4
     ram_gb = _estimate_ram_gb()
     # Assume each headless Chrome instance consumes roughly 0.5GB.
