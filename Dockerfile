@@ -43,41 +43,56 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Verify Chrome installation
 RUN google-chrome --version || echo "Chrome installation verification"
 
-# Install matching ChromeDriver using new Chrome for Testing API
+# Install matching ChromeDriver using Chrome for Testing API
+# Get exact Chrome version and find matching ChromeDriver
 RUN set -eux; \
     CHROME_VERSION="$(google-chrome --version | awk '{print $3}')" ; \
     CHROME_MAJOR="${CHROME_VERSION%%.*}" ; \
-    CHROME_BUILD="${CHROME_VERSION}" ; \
     echo "Chrome version: ${CHROME_VERSION}, Major: ${CHROME_MAJOR}" ; \
-    # Use Chrome for Testing API for Chrome 115+ \
-    if [ "${CHROME_MAJOR}" -ge 115 ]; then \
-        DRIVER_VERSION="$(curl -sSf "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}" || echo "")" ; \
-        if [ -z "${DRIVER_VERSION}" ]; then \
-            DRIVER_VERSION="$(curl -sSf "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE" || echo "")" ; \
-        fi ; \
-        if [ -n "${DRIVER_VERSION}" ]; then \
-            wget -q -O /tmp/chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip" || \
-            wget -q -O /tmp/chromedriver.zip "https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip" ; \
-        fi ; \
-    else \
-        # Fallback to old API for Chrome < 115 \
-        DRIVER_VERSION="$(curl -sSf "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR}" || curl -sSf "https://chromedriver.storage.googleapis.com/LATEST_RELEASE")" ; \
-        wget -q -O /tmp/chromedriver.zip "https://chromedriver.storage.googleapis.com/${DRIVER_VERSION}/chromedriver_linux64.zip" ; \
+    # Use Chrome for Testing API to get exact matching version \
+    # Parse the last-known-good-versions JSON to find stable version \
+    VERSIONS_JSON="$(curl -sSf "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json" || echo "")" ; \
+    if [ -n "${VERSIONS_JSON}" ]; then \
+        # Extract stable version from JSON using Python (more reliable) \
+        DRIVER_VERSION="$(echo "${VERSIONS_JSON}" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['channels']['Stable']['version'])" 2>/dev/null || echo "")" ; \
     fi ; \
-    if [ -f /tmp/chromedriver.zip ]; then \
-        unzip -q /tmp/chromedriver.zip -d /tmp/ ; \
-        if [ -f /tmp/chromedriver-linux64/chromedriver ]; then \
-            mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver ; \
-        elif [ -f /tmp/chromedriver ]; then \
-            mv /tmp/chromedriver /usr/local/bin/chromedriver ; \
-        fi ; \
-        chmod +x /usr/local/bin/chromedriver ; \
-        rm -rf /tmp/chromedriver.zip /tmp/chromedriver-linux64 /tmp/chromedriver ; \
-        chromedriver --version || echo "ChromeDriver installation verification failed" ; \
-    else \
-        echo "ERROR: Failed to download ChromeDriver" ; \
+    if [ -z "${DRIVER_VERSION}" ]; then \
+        # Fallback: try to get latest for this major version \
+        DRIVER_VERSION="$(curl -sSf "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_MAJOR}" || echo "")" ; \
+    fi ; \
+    if [ -z "${DRIVER_VERSION}" ]; then \
+        # Final fallback: get latest stable from simple endpoint \
+        DRIVER_VERSION="$(curl -sSf "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['channels']['Stable']['version'])" 2>/dev/null || echo "")" ; \
+    fi ; \
+    if [ -z "${DRIVER_VERSION}" ]; then \
+        echo "ERROR: Could not determine ChromeDriver version" ; \
         exit 1 ; \
-    fi
+    fi ; \
+    echo "Installing ChromeDriver version: ${DRIVER_VERSION} (for Chrome ${CHROME_VERSION})" ; \
+    # Download ChromeDriver for Linux 64-bit \
+    wget -q -O /tmp/chromedriver.zip "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip" || \
+    wget -q -O /tmp/chromedriver.zip "https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip" || \
+    (echo "ERROR: Failed to download ChromeDriver ${DRIVER_VERSION}" && exit 1) ; \
+    unzip -q /tmp/chromedriver.zip -d /tmp/ ; \
+    if [ -f /tmp/chromedriver-linux64/chromedriver ]; then \
+        mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver ; \
+    elif [ -f /tmp/chromedriver ]; then \
+        mv /tmp/chromedriver /usr/local/bin/chromedriver ; \
+    else \
+        echo "ERROR: ChromeDriver binary not found in archive" ; \
+        exit 1 ; \
+    fi ; \
+    chmod +x /usr/local/bin/chromedriver ; \
+    rm -rf /tmp/chromedriver.zip /tmp/chromedriver-linux64 /tmp/chromedriver ; \
+    echo "Verifying ChromeDriver installation..." ; \
+    CHROMEDRIVER_VERSION="$(chromedriver --version | awk '{print $2}')" ; \
+    echo "ChromeDriver version: ${CHROMEDRIVER_VERSION}" ; \
+    echo "Chrome version: ${CHROME_VERSION}" ; \
+    if [ -z "${CHROMEDRIVER_VERSION}" ]; then \
+        echo "ERROR: ChromeDriver verification failed" ; \
+        exit 1 ; \
+    fi ; \
+    echo "ChromeDriver installed successfully"
 
 # Set working directory
 WORKDIR /app
