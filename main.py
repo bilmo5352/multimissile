@@ -321,7 +321,7 @@ class UniversalProductExtractor:
 
     # ------------------------ Playwright Integration ---------------------------
     class _PWElement:
-        def __init__(self, manager: _PlaywrightAsyncManager, handle: ElementHandle):
+        def __init__(self, manager: '_PlaywrightAsyncManager', handle: 'ElementHandle'):
             self._manager = manager
             self._handle = handle
 
@@ -361,7 +361,7 @@ class UniversalProductExtractor:
                 pass
 
     class _PWDriver:
-        def __init__(self, manager: _PlaywrightAsyncManager, context, page: AsyncPage):
+        def __init__(self, manager: '_PlaywrightAsyncManager', context, page: 'AsyncPage'):
             self._manager = manager
             self._context = context
             self._page = page
