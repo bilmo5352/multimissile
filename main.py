@@ -92,8 +92,8 @@ class UniversalProductExtractor:
         self._drivers_lock = threading.Lock()
         self._active_drivers = set()
         self._driver_creation_lock = threading.Lock()  # Lock for driver creation to prevent race conditions
-        # Semaphore to limit concurrent driver creation (max 2 at a time to avoid Errno 11)
-        self._driver_creation_semaphore = threading.Semaphore(2)
+        # Semaphore to limit concurrent driver creation (strictly 1 at a time to avoid PID/FD spikes)
+        self._driver_creation_semaphore = threading.Semaphore(1)
         # Track URLs processed per driver to force cleanup periodically
         self._urls_processed = 0
         self._urls_per_driver_cleanup = _get_env_int("URLS_PER_DRIVER_CLEANUP", 25)  # Restart driver every 25 URLs (more aggressive)
@@ -920,8 +920,8 @@ class UniversalProductExtractor:
         return clicked
 
     def _setup_driver(self) -> webdriver.Chrome:
-        # Use semaphore to limit concurrent driver creation (max 2 at a time)
-        # This prevents Railway Errno 11 errors from too many simultaneous process creations
+        # Use semaphore to strictly serialize driver creation
+        # This prevents Errno 11 from too many simultaneous process creations
         with self._driver_creation_semaphore:
             # Also use lock for additional safety
             with self._driver_creation_lock:
@@ -943,7 +943,32 @@ class UniversalProductExtractor:
         chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"]) 
         chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        
+        # Reduce Chrome child-process fan-out and memory
+        chrome_options.add_argument('--no-zygote')
+        chrome_options.add_argument('--renderer-process-limit=1')
+        chrome_options.add_argument('--js-flags=--max-old-space-size=128')
+        chrome_options.add_argument('--no-first-run')
+        chrome_options.add_argument('--no-default-browser-check')
+        # Lighten page costs
+        chrome_prefs = {
+            "profile.managed_default_content_settings.images": 2
+        }
+        chrome_options.add_experimental_option("prefs", chrome_prefs)
+        # Faster navigation
+        try:
+            chrome_options.page_load_strategy = "eager"
+        except Exception:
+            pass
+        # Unique user data dir per thread to avoid profile locks
+        try:
+            _tid = threading.current_thread().ident or 0
+            chrome_options.add_argument(f'--user-data-dir=/tmp/chrome-profile-{_tid}')
+        except Exception:
+            pass
+        # Enable Chrome verbose logs to stderr (captured by platform logs)
+        chrome_options.add_argument('--enable-logging=stderr')
+        chrome_options.add_argument('--v=1')
+
         # Additional Railway/container-specific options for stability
         chrome_options.add_argument('--disable-setuid-sandbox')
         chrome_options.add_argument('--disable-background-timer-throttling')
@@ -953,7 +978,7 @@ class UniversalProductExtractor:
         chrome_options.add_argument('--disable-ipc-flooding-protection')
         # Note: Remote debugging port removed to avoid port conflicts in multi-threaded environments
         # If debugging is needed, use --remote-debugging-port with a unique port per thread
-        
+
         chrome_binary = os.getenv("CHROME_BIN")
         if chrome_binary:
             chrome_options.binary_location = chrome_binary
@@ -978,7 +1003,26 @@ class UniversalProductExtractor:
         # Create delays between 0.5 to 5 seconds, spread across workers
         startup_delay = 0.5 + (random.uniform(0.5, 1.5) * (thread_id % 20))
         time.sleep(startup_delay)
-        
+
+        # Pre-spawn guard: if child processes or FDs are high, wait and try to recycle
+        try:
+            child_count = _count_child_processes()
+            fd_count = _count_open_fds()
+            # Thresholds are conservative; tune as needed
+            if (child_count != -1 and child_count > 150) or (fd_count != -1 and fd_count > 2048):
+                _log_with_thread(f"High system load (children={child_count}, fds={fd_count}); delaying driver spawn by 10s", "[!]")
+                time.sleep(10)
+        except Exception:
+            pass
+
+        # Prepare per-thread driver log
+        driver_log_handle = None
+        try:
+            log_path = f"/tmp/chromedriver_{thread_id}.log"
+            driver_log_handle = open(log_path, "a", buffering=1, encoding="utf-8")
+        except Exception:
+            driver_log_handle = None
+
         # Retry logic for each path
         for path in driver_paths:
             if not path or not os.path.exists(path):
@@ -992,8 +1036,14 @@ class UniversalProductExtractor:
                     else:
                         # Small initial delay even on first attempt
                         time.sleep(0.3)
-                    
+                    # Create service with per-thread log output if supported
                     service = Service(path)
+                    try:
+                        # Selenium 4: Service.log_output can capture driver logs
+                        if driver_log_handle is not None:
+                            service.log_output = driver_log_handle
+                    except Exception:
+                        pass
                     driver = webdriver.Chrome(service=service, options=chrome_options)
                     driver.set_page_load_timeout(30)
                     return driver
@@ -1004,41 +1054,7 @@ class UniversalProductExtractor:
                     else:
                         _log_with_thread(f"Failed to start Chrome using system driver at {path}: {exc}", "[!]")
 
-        # Retry logic for WebDriver Manager
-        if WEBDRIVER_MANAGER_AVAILABLE:
-            for attempt in range(max_retries):
-                try:
-                    if attempt > 0:
-                        delay = retry_delay * (2 ** attempt)
-                        time.sleep(delay)
-                    else:
-                        time.sleep(0.3)
-                    service = Service(ChromeDriverManager().install())
-                    driver = webdriver.Chrome(service=service, options=chrome_options)
-                    driver.set_page_load_timeout(30)
-                    return driver
-                except Exception as exc:
-                    last_error = exc
-                    if attempt < max_retries - 1:
-                        _log_with_thread(f"Retry {attempt + 1}/{max_retries} for WebDriver Manager: {exc}", "[!]")
-                    else:
-                        _log_with_thread(f"WebDriver Manager failed to obtain driver: {exc}", "[!]")
-
-        # Final fallback with retry
-        for attempt in range(max_retries):
-            try:
-                if attempt > 0:
-                    delay = retry_delay * (2 ** attempt)
-                    time.sleep(delay)
-                else:
-                    time.sleep(0.3)
-                driver = webdriver.Chrome(options=chrome_options)
-                driver.set_page_load_timeout(30)
-                return driver
-            except Exception as exc:
-                last_error = exc
-                if attempt < max_retries - 1:
-                    _log_with_thread(f"Retry {attempt + 1}/{max_retries} for default Chrome driver: {exc}", "[!]")
+        # Strictly require system ChromeDriver; avoid Selenium Manager/WDM to reduce process churn
         
         if last_error:
             raise last_error
@@ -1717,6 +1733,9 @@ class ParallelURLExtractor:
         default_wait_seconds: int = 12,
         default_max_items: int = 50,
     ):
+        # Log system limits early and size workers accordingly
+        _log_system_limits("At startup")
+        _log_chrome_versions()
         self.max_workers = _determine_parallel_workers(max_workers)
         db_batch_size = _get_env_int("DB_URL_BATCH_SIZE", 1000)
         self.batch_size = max(1, db_batch_size)
@@ -2222,6 +2241,112 @@ def _log_ram_usage(context: str = ""):
         thread_id = _get_thread_id()
         print(f"[{thread_id}] [RAM] {context} - Total: {ram['total_gb']:.2f}GB, Used: {ram['used_gb']:.2f}GB ({ram['percent']:.1f}%), Available: {ram['available_gb']:.2f}GB")
 
+def _safe_read_text(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+def _count_open_fds() -> int:
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except Exception:
+        return -1
+
+def _count_child_processes() -> int:
+    # Count immediate children by PPid in /proc/*/status
+    my_pid = os.getpid()
+    count = 0
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid_path = os.path.join("/proc", name)
+            status = _safe_read_text(os.path.join(pid_path, "status")) or ""
+            for line in status.splitlines():
+                if line.startswith("PPid:"):
+                    try:
+                        ppid = int(line.split()[1])
+                        if ppid == my_pid:
+                            count += 1
+                    except Exception:
+                        pass
+                    break
+    except Exception:
+        return -1
+    return count
+
+def _read_pids_limit() -> Optional[int]:
+    # Try cgroup v2 pids.max
+    for path in ("/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids.max".replace("//","/")):
+        txt = _safe_read_text(path)
+        if txt:
+            val = txt.strip()
+            if val != "max":
+                try:
+                    return int(val)
+                except Exception:
+                    pass
+    # Fallback to kernel pid_max (system-wide, less useful in containers)
+    txt = _safe_read_text("/proc/sys/kernel/pid_max")
+    if txt:
+        try:
+            return int(txt.strip())
+        except Exception:
+            return None
+    return None
+
+def _log_system_limits(context: str = "System limits") -> Dict[str, Any]:
+    limits_text = _safe_read_text("/proc/self/limits") or ""
+    pids_limit = _read_pids_limit()
+    open_fds = _count_open_fds()
+    child_procs = _count_child_processes()
+    info = {
+        "pids_limit": pids_limit,
+        "open_fds": open_fds,
+        "child_procs": child_procs,
+    }
+    thread_id = _get_thread_id()
+    print(f"[{thread_id}] [LIMITS] {context}: pids_limit={pids_limit}, open_fds={open_fds}, child_procs={child_procs}")
+    if limits_text:
+        # Print a condensed single-line summary for key limits
+        for key in ("Max processes", "Max open files"):
+            for line in limits_text.splitlines():
+                if line.startswith(key):
+                    print(f"[{thread_id}] [LIMITS] {line.strip()}")
+                    break
+    return info
+
+def _estimate_safe_workers_from_pids(target_processes_per_driver: int = 5, safety_margin: int = 50) -> Optional[int]:
+    pids_limit = _read_pids_limit()
+    if not pids_limit or pids_limit <= 0:
+        return None
+    child_count = _count_child_processes()
+    if child_count < 0:
+        child_count = 0
+    # Reserve margin for Python, DB client, and system daemons
+    remaining = max(0, pids_limit - child_count - safety_margin)
+    if remaining <= 0:
+        return 1
+    return max(1, remaining // max(1, target_processes_per_driver))
+
+def _log_chrome_versions() -> None:
+    """Log Chrome and ChromeDriver versions to aid troubleshooting."""
+    thread_id = _get_thread_id()
+    def _run(cmd: List[str]) -> str:
+        try:
+            import subprocess
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=5)
+            return out.strip().splitlines()[0]
+        except Exception as exc:
+            return f"unavailable ({exc})"
+    chrome_bin = os.getenv("CHROME_BIN", "google-chrome")
+    chrome_ver = _run([chrome_bin, "--version"])
+    chromedriver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
+    chromedriver_ver = _run([chromedriver_path, "--version"])
+    print(f"[{thread_id}] [VERSIONS] Chrome: {chrome_ver}")
+    print(f"[{thread_id}] [VERSIONS] ChromeDriver: {chromedriver_ver}")
 
 def _determine_parallel_workers(explicit_workers: Optional[int] = None) -> int:
     if explicit_workers and explicit_workers > 0:
@@ -2252,7 +2377,12 @@ def _determine_parallel_workers(explicit_workers: Optional[int] = None) -> int:
             max_workers = 20
         else:
             max_workers = 8
-        return max(1, min(ram_limited, cpu_limited, max_workers))
+        # Also consider cgroup PID limits to avoid Errno 11
+        pids_based = _estimate_safe_workers_from_pids() or max_workers
+        chosen = max(1, min(ram_limited, cpu_limited, max_workers, pids_based))
+        thread_id = _get_thread_id()
+        print(f"[{thread_id}] [*] Autosized workers (Railway): RAM→{ram_limited}, CPU→{cpu_limited}, MAX→{max_workers}, PIDS→{pids_based} => {chosen}")
+        return chosen
     
     # Standard logic for non-Railway environments
     cpu_count = os.cpu_count() or 4
@@ -2261,7 +2391,12 @@ def _determine_parallel_workers(explicit_workers: Optional[int] = None) -> int:
     ram_limited = max(1, int(ram_gb / 0.5))
     # Allow up to 4x CPU cores but respect RAM limit.
     cpu_limited = max(1, cpu_count * 4)
-    return max(1, min(ram_limited, cpu_limited, 250))
+    # On non-Railway, still respect PID limits if available
+    pids_based = _estimate_safe_workers_from_pids() or 250
+    chosen = max(1, min(ram_limited, cpu_limited, pids_based, 250))
+    thread_id = _get_thread_id()
+    print(f"[{thread_id}] [*] Autosized workers: RAM→{ram_limited}, CPU→{cpu_limited}, PIDS→{pids_based} => {chosen}")
+    return chosen
 
 
 def _parse_status_filters(raw: Optional[str]) -> List[str]:
