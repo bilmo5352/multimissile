@@ -34,6 +34,11 @@ import random
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Iterable, Union, Tuple
 import shutil
+try:
+    from playwright.sync_api import sync_playwright, Playwright, Browser, Page
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
 
 
 def _get_thread_id() -> str:
@@ -218,6 +223,119 @@ class UniversalProductExtractor:
                 self._active_drivers.add(driver)
         
         return driver
+
+    # ------------------------ Playwright Integration ---------------------------
+    class _PWElement:
+        def __init__(self, handle):
+            self._handle = handle
+            self._locator = handle
+        def is_displayed(self) -> bool:
+            try:
+                return self._handle.is_visible()
+            except Exception:
+                return True
+        def is_enabled(self) -> bool:
+            try:
+                return self._handle.is_enabled()
+            except Exception:
+                return True
+        def get_attribute(self, name: str) -> Optional[str]:
+            try:
+                return self._handle.get_attribute(name)
+            except Exception:
+                return None
+        @property
+        def text(self) -> str:
+            try:
+                return self._handle.inner_text() or ""
+            except Exception:
+                return ""
+        def click(self):
+            try:
+                self._handle.click(timeout=3000)
+            except Exception:
+                pass
+
+    class _PWDriver:
+        def __init__(self, page: Page):
+            self._page = page
+            try:
+                self._page.set_default_navigation_timeout(30000)
+                self._page.set_default_timeout(10000)
+            except Exception:
+                pass
+        def set_page_load_timeout(self, ms: int):
+            try:
+                self._page.set_default_navigation_timeout(ms * 1000)
+            except Exception:
+                pass
+        def get(self, url: str):
+            self._page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        def find_elements(self, by, selector: str):
+            try:
+                if by == By.CSS_SELECTOR:
+                    els = self._page.query_selector_all(selector)
+                elif by == By.XPATH:
+                    els = self._page.query_selector_all(f'xpath={selector}')
+                elif by == By.TAG_NAME:
+                    els = self._page.query_selector_all(selector)
+                else:
+                    els = self._page.query_selector_all(selector)
+                return [UniversalProductExtractor._PWElement(e) for e in els if e is not None]
+            except Exception:
+                return []
+        def find_element(self, by, selector: str):
+            els = self.find_elements(by, selector)
+            return els[0] if els else None
+        def execute_script(self, script: str, *args):
+            try:
+                return self._page.evaluate(script, *args)
+            except Exception:
+                return None
+        def quit(self):
+            try:
+                self._page.context.close()
+            except Exception:
+                pass
+
+    _PW_SINGLETON_LOCK = threading.Lock()
+    _PW_BROWSER: Optional[Browser] = None
+    _PW_PLAYWRIGHT: Optional[Playwright] = None
+
+    def _ensure_playwright_browser(self) -> Browser:
+        with UniversalProductExtractor._PW_SINGLETON_LOCK:
+            if UniversalProductExtractor._PW_BROWSER is not None:
+                return UniversalProductExtractor._PW_BROWSER
+            if not PLAYWRIGHT_AVAILABLE:
+                raise RuntimeError("Playwright not available")
+            UniversalProductExtractor._PW_PLAYWRIGHT = sync_playwright().start()
+            pw = UniversalProductExtractor._PW_PLAYWRIGHT
+            assert pw is not None
+            UniversalProductExtractor._PW_BROWSER = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--no-zygote",
+                    "--renderer-process-limit=1",
+                    "--js-flags=--max-old-space-size=128",
+                    "--disable-extensions",
+                    "--disable-logging",
+                    "--disable-notifications",
+                    "--disable-default-apps",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding",
+                    "--disable-features=TranslateUI",
+                    "--disable-ipc-flooding-protection",
+                    "--disk-cache-size=0",
+                    "--media-cache-size=0",
+                ],
+            )
+            return UniversalProductExtractor._PW_BROWSER
+
 
     def _reset_thread_driver(self):
         driver = getattr(self._thread_local, "driver", None)
@@ -954,6 +1072,20 @@ class UniversalProductExtractor:
                 return self._setup_driver_internal()
 
     def _setup_driver_internal(self) -> webdriver.Chrome:
+        # Switch to Playwright if enabled and available to drastically reduce OS process usage
+        use_playwright = os.getenv("USE_PLAYWRIGHT", "1") == "1"
+        if use_playwright and PLAYWRIGHT_AVAILABLE:
+            browser = self._ensure_playwright_browser()
+            # Create isolated context/page per thread
+            context = browser.new_context(ignore_https_errors=True)
+            # Disable images via route for performance similar to Selenium prefs
+            try:
+                context.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image", "media") else route.continue_())
+            except Exception:
+                pass
+            page = context.new_page()
+            self._thread_local.profile_dir = None  # Playwright manages its own storage unless configured
+            return UniversalProductExtractor._PWDriver(page)  # type: ignore[return-value]
         chrome_options = Options()
         chrome_options.add_argument('--headless=new')
         chrome_options.add_argument('--no-sandbox')
